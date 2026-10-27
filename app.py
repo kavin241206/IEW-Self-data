@@ -20,8 +20,6 @@ Internal units: liquids m³/d · gas Sm³/d · pressure bar · choke size 1/64 i
 """
 from __future__ import annotations
 
-import ast
-import builtins
 import difflib
 import hashlib
 import html
@@ -29,6 +27,11 @@ import io
 import os
 import re
 from dataclasses import astuple, dataclass
+
+# One thread per model fit. At dashboard data sizes this is fast (< 1 s), and it avoids a severe slowdown (up to
+# 100×) when several Streamlit sessions or processes share the same CPU cores and threads fight each other.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 import numpy as np
 import pandas as pd
@@ -39,6 +42,12 @@ from scipy.optimize import curve_fit
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, IsolationForest
 from sklearn.metrics import mean_absolute_error, r2_score
 
+try:                                                    # also applies if numpy/sklearn were imported before this file
+    from threadpoolctl import threadpool_limits
+    threadpool_limits(1)
+except Exception:  # noqa: BLE001
+    pass
+
 # =============================================================================
 # 1. CONFIGURATION
 # =============================================================================
@@ -48,7 +57,7 @@ AUTHOR = "Kavinkarthick"
 CORE_COLUMNS = ["Date", "Well", "Oil_Rate", "Water_Rate", "Gas_Rate",
                 "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"]
 SENSOR_COLUMNS = ["Pump_Vibration", "Motor_Temperature", "Motor_Current", "Pump_Frequency", "Energy_kWh"]
-OPTIONAL_COLUMNS = ["Choke_Size"] + SENSOR_COLUMNS
+OPTIONAL_COLUMNS = ["Choke_Size", "Hours_On"] + SENSOR_COLUMNS
 CORE_NUMERIC = CORE_COLUMNS[2:]
 NUMERIC_COLUMNS = CORE_NUMERIC + OPTIONAL_COLUMNS
 REQUIRED = ["Date", "Well", "Oil_Rate"]          # everything else is optional or derived
@@ -71,6 +80,7 @@ DESCRIPTIONS = {
     "Injection_Rate": "Lift-gas (or injection) rate", "Choke_Size": "Production choke (bean) size",
     "Pump_Vibration": "Pump vibration", "Motor_Temperature": "Motor temperature", "Motor_Current": "Motor current",
     "Pump_Frequency": "VFD / pump frequency", "Energy_kWh": "Energy used in the interval",
+    "Hours_On": "Hours the well produced that day (0 = shut in)",
     "Water_Cut": "Water cut / BS&W (% or fraction) — used to derive missing rates",
     "Liquid_Rate": "Gross liquid rate — used to derive missing oil or water",
     "GOR": "Gas-oil ratio — used to derive a missing gas rate",
@@ -94,8 +104,11 @@ ALIASES = {
     "Pump_Vibration": ["pump vibration", "vibration", "vibration rms"],
     "Motor_Temperature": ["motor temperature", "motor temp", "motor temperature c"],
     "Motor_Current": ["motor current", "current", "motor amps", "motor current a"],
-    "Pump_Frequency": ["pump frequency", "frequency", "vfd frequency", "frequency hz"],
+    "Pump_Frequency": ["pump frequency", "frequency", "vfd frequency", "frequency hz", "esp freq", "esp frequency",
+                       "freq", "pump freq", "vsd frequency", "drive frequency", "motor frequency", "vfd freq"],
     "Energy_kWh": ["energy kwh", "energy", "power consumption kwh", "energy consumed", "energy consumption"],
+    "Hours_On": ["hours on", "hours online", "hours on line", "uptime", "up time", "run hours", "hrs on", "on hours",
+                 "producing hours", "production hours", "on stream hours", "onstream hours", "hours on stream"],
     "Water_Cut": ["water cut", "watercut", "wc", "bsw", "bs&w", "bs and w", "water cut %", "water cut (%)"],
     "Liquid_Rate": ["liquid rate", "liquid", "gross rate", "gross liquid", "total liquid", "gross fluid", "ql",
                     "fluid rate", "total fluid", "blpd"],
@@ -112,13 +125,14 @@ UNITS = {  # standard = source × factor (°F also gets an offset)
     "Motor_Temperature": {"°C": 1.0, "°F": 5.0 / 9.0}, "Motor_Current": {"A": 1.0, "mA": 0.001},
     "Pump_Frequency": {"Hz": 1.0, "rpm": 1.0 / 60.0}, "Pump_Vibration": {"mm/s": 1.0, "in/s": 25.4},
     "Energy_kWh": {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0},
+    "Hours_On": {"h": 1.0, "%": 0.24},
     "Liquid_Rate": _LIQ,
     "GOR": {"Sm³/m³": 1.0, "scf/bbl": 0.178108, "Mscf/bbl": 178.108},
 }
 STD_UNIT = {"Oil_Rate": "m³/d", "Water_Rate": "m³/d", "Gas_Rate": "Sm³/d", "Injection_Rate": "Sm³/d",
             "Wellhead_Pressure": "bar", "Bottomhole_Pressure": "bar", "Choke_Size": "1/64 in",
             "Motor_Temperature": "°C", "Motor_Current": "A", "Pump_Frequency": "Hz", "Pump_Vibration": "mm/s",
-            "Energy_kWh": "kWh", "Liquid_Rate": "m³/d", "GOR": "Sm³/m³"}
+            "Energy_kWh": "kWh", "Liquid_Rate": "m³/d", "GOR": "Sm³/m³", "Hours_On": "h"}
 MISSING = {"", "nan", "none", "null", "n/a", "na", "unknown", "—", "-", "<na>", "#n/a", "nat"}
 M3_TO_BBL = 6.289811
 GRID_CO2 = 0.71   # kg CO2 per kWh — Indian grid average; adjustable in Settings
@@ -144,13 +158,14 @@ def _strip_units(name) -> str:
 _LOOKUP = {_norm(a): canon for canon, names in ALIASES.items() for a in [canon, *names]}
 # Keyword fallback for headers no alias list anticipated (first match wins, most specific first)
 _KEYWORDS = [
+    ("Hours_On", ("uptime", "hours on", "run hours", "hrs on", "on stream")),
     ("Water_Cut", ("water cut", "watercut", "bsw", "bs&w")), ("GOR", ("gas oil ratio", "gas/oil", "gor")),
     ("Liquid_Rate", ("liquid", "gross", "total fluid", "blpd")),
     ("Choke_Size", ("choke", "bean")), ("Injection_Rate", ("lift gas", "gas lift", "injection", "glir", "gl inj", "inj rate", "gl rate", "inj")),
     ("Bottomhole_Pressure", ("bottom hole", "bottomhole", "bhp", "downhole press", "pwf")),
     ("Wellhead_Pressure", ("wellhead", "well head", "tubing head", "thp", "whp")),
     ("Pump_Vibration", ("vibration",)), ("Motor_Temperature", ("motor temp", "winding temp")),
-    ("Motor_Current", ("amps", "current")), ("Pump_Frequency", ("frequency", "hz", "vfd")),
+    ("Motor_Current", ("amps", "current")), ("Pump_Frequency", ("frequency", "freq", "hz", "vfd", "vsd")),
     ("Energy_kWh", ("kwh", "energy", "power")), ("Water_Rate", ("water", "bwpd", "qw")),
     ("Gas_Rate", ("gas", "qg", "mscf")), ("Oil_Rate", ("oil", "bopd", "qo", "crude")),
     ("Well", ("well",)), ("Date", ("date", "time", "day")),
@@ -340,7 +355,8 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = Non
         frame.loc[bad, col] = np.nan
 
     for col in [c for c in OPTIONAL_COLUMNS if c in frame.columns]:
-        if miss_frac.get(col, 0) > 0.6:
+        best_well = frame[col].notna().groupby(frame["Well"]).mean().max() if len(frame) else 0
+        if miss_frac.get(col, 0) > 0.6 and not best_well >= 0.4:    # e.g. ESP data exists only on the ESP wells
             frame = frame.drop(columns=col)
             numeric.remove(col)
             rep["dropped_optional"].append(col)
@@ -397,7 +413,10 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = Non
         nonneg = np.array([c in RATE_COLUMNS + PRESSURE_COLUMNS for c in cap_cols])
         lo = np.where(nonneg, np.maximum(lo, 0.0), lo)
         vals = frame[cap_cols].to_numpy(dtype=float)
-        out = enough & ((vals < lo) | (vals > hi))
+        flowing = (frame["Hours_On"] >= 23.5).to_numpy()[:, None] if "Hours_On" in frame.columns \
+            else np.ones((len(frame), 1), bool)
+        # zeros are real "off" states and shut-in build-up is real physics → only cap readings taken while flowing
+        out = enough & flowing & ((vals > hi) | ((vals < lo) & (vals != 0)))
         rep["capped"] = int(out.sum())
         frame[cap_cols] = np.where(out, np.clip(vals, lo, hi), vals)
 
@@ -774,6 +793,27 @@ def auto_structure(grids: dict, file_stem: str):
         if wcol and wcol != "Well" and wcol in f.columns:
             frames[n] = f.rename(columns={wcol: "Well"})
         frames[n]["Well"] = frames[n]["Well"].astype(str).str.strip().str.upper()
+    # Same well written differently ("ALPHA 101", "Alpha-101", "ALPHA_101") → one ID (the most common spelling)
+    allw = pd.concat([f["Well"] for f in frames.values()], ignore_index=True)
+    key = allw.str.replace(r"[^A-Z0-9]", "", regex=True)
+    canon = allw.groupby(key).agg(lambda s: s.value_counts().index[0])
+    variants = allw.groupby(key).nunique()
+    if (variants > 1).any():
+        ex = allw[key == variants[variants > 1].index[0]].unique()[:2]
+        log.append(f"matched well names written differently (e.g. '{ex[0]}' = '{ex[-1]}')")
+    for n in frames:
+        k = frames[n]["Well"].str.replace(r"[^A-Z0-9]", "", regex=True)
+        frames[n]["Well"] = k.map(canon).fillna(frames[n]["Well"])
+    # Daily (or coarser) data + timestamps with a time of day (e.g. well tests at 10:30) → align to the day
+    gap_days = {n: (f.sort_values("Date").groupby("Well")["Date"].diff().dt.total_seconds() / 86400).median()
+                for n, f in frames.items()}
+    base_n = max(frames, key=lambda n: len(frames[n]))
+    if pd.notna(gap_days.get(base_n)) and gap_days[base_n] >= 0.9:
+        timed = [n for n, f in frames.items() if (f["Date"].dt.normalize() != f["Date"]).any()]
+        for n in timed:
+            frames[n]["Date"] = frames[n]["Date"].dt.normalize()
+        if timed:
+            log.append(f"aligned timestamps with a time of day to their date in: {', '.join(map(str, timed))}")
     groups = []
     for n, f in frames.items():
         for g in groups:
@@ -788,6 +828,7 @@ def auto_structure(grids: dict, file_stem: str):
         if len(g) > 1:
             log.append(f"stacked {len(g)} sheets with the same layout: {', '.join(str(n) for n, _ in g)}")
         tables.append(pd.concat([f for _, f in g], ignore_index=True))
+    tables.sort(key=len, reverse=True)                  # the biggest table (e.g. daily operations) is the base
     out = tables[0]
     for t in tables[1:]:
         keys = ["Date", "Well"]
@@ -857,62 +898,11 @@ def read_file(key: str, _data: bytes, name: str) -> dict:
     return {"data": grid}
 
 
-STRUCTURE_GUIDE = """You restructure messy oil & gas production spreadsheets into ONE tidy table.
-Variable `sheets` is a dict {sheet name: raw grid DataFrame read with header=None (all cells as found)}.
-Write Python (pd, np available; no imports) that sets `result` to a DataFrame with ONE ROW PER WELL PER DATE:
-a 'Date' column (datetime), a 'Well' column (string ID), and one numeric column per measurement, keeping the
-original measurement names (add units in brackets if you can see them, e.g. 'Oil (bbl/d)').
-Handle titles, units rows, merged/multi-level headers, one-sheet-per-well, wide layouts, transposed tables,
-totals rows and notes sheets. If there is no well identifier, use the sheet name or 'WELL-1'.
-Reply with ONE ```python code block only."""
-
-
-def llm_structure(grids: dict):
-    """Ask Claude to write the reshaping when the built-in rules cannot make sense of the layout."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=_api_key())
-    preview = "\n\n".join(f"SHEET {n!r} shape={g.shape}\n{g.head(25).to_csv(index=False, header=False)}"
-                            for n, g in list(grids.items())[:8])
-    messages = [{"role": "user", "content": preview[:60000]}]
-    for _ in range(2):
-        msg, _ = _call_claude(client, messages, STRUCTURE_GUIDE, 4000)
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-        code = _extract_code(text)
-        try:
-            ns = run_safely(code, {"sheets": {k: v.copy() for k, v in grids.items()}, "pd": pd, "np": np})
-            res = ns.get("result")
-            if isinstance(res, pd.DataFrame) and len(res) >= 3:
-                return _coerce_types(res.reset_index(drop=True)), code
-            raise ValueError("result was not a table")
-        except Exception as exc:  # noqa: BLE001
-            messages += [{"role": "assistant", "content": text},
-                         {"role": "user", "content": f"That failed: {type(exc).__name__}: {exc}. Return corrected code only."}]
-    return None, None
-
-
 @st.cache_resource(show_spinner=False, max_entries=3)
-def structure_cached(key: str, _grids: dict, stem: str, use_llm: bool):
-    """Built-in rules first; if the result still lacks Date / Well / oil, let Claude restructure (when available)."""
+def structure_cached(key: str, _grids: dict, stem: str):
+    """Turn any layout into one tidy table using the built-in rules."""
     tidy, log = auto_structure(_grids, stem)
-    found = set(infer_columns(tidy)[0]) if tidy is not None else set()
-    ok = tidy is not None and {"Date", "Well"} <= found and bool({"Oil_Rate", "Liquid_Rate"} & found) \
-        and not any(x.startswith("⚠") for x in log)
-    code = None
-    if not ok and use_llm:
-        try:
-            alt, code = llm_structure(_grids)
-            if alt is not None:
-                tidy = alt
-                log = [x for x in log if not x.startswith("⚠")] + \
-                      ["Built-in rules were not sure about this layout — Claude restructured it (see code below)."]
-                m = infer_columns(tidy)[0]
-                if {"Date", "Well"} <= set(m):
-                    d = tidy[m["Well"]].astype(str) + "|" + pd.to_datetime(tidy[m["Date"]], errors="coerce").astype(str)
-                    if d.duplicated().mean() > 0.05:
-                        log.append("⚠ CHECK: Claude's table still has repeated well/date rows — please review.")
-        except Exception as exc:  # noqa: BLE001
-            log = log + [f"AI restructuring unavailable ({type(exc).__name__})."]
-    return tidy, log, code
+    return tidy, log, None
 
 
 @st.cache_resource(show_spinner=False, max_entries=3)
@@ -994,12 +984,12 @@ def is_test_mode(df: pd.DataFrame) -> bool:
 
 # ---- 3a. AI virtual flow meter ------------------------------------------------
 def _last_before(values: pd.Series, wells: pd.Series) -> pd.Series:
-    """For every row: the most recent non-missing value STRICTLY before it, within the same well."""
-    return values.groupby(wells).transform(lambda s: s.shift(1).ffill())
+    """For every row: the most recent non-missing value STRICTLY before it, within the same well (vectorised)."""
+    return values.groupby(wells).shift(1).groupby(wells).ffill()
 
 
 def _next_after(values: pd.Series, wells: pd.Series) -> pd.Series:
-    return values.groupby(wells).transform(lambda s: s.shift(-1).bfill())
+    return values.groupby(wells).shift(-1).groupby(wells).bfill()
 
 
 def _add_reference(d: pd.DataFrame, interval: int, test_mode: bool) -> pd.DataFrame:
@@ -1025,8 +1015,9 @@ def _add_reference(d: pd.DataFrame, interval: int, test_mode: bool) -> pd.DataFr
     d["Next_Oil"] = _next_after(d["Oil_Rate"].where(is_test), w)
     d["Next_Day"] = _next_after(d["Days"].where(is_test), w)
     # trend between the last two tests
-    prev_oil = d["Oil_Rate"].where(is_test).groupby(w).transform(lambda s: s.dropna().shift(1).reindex(s.index))
-    prev_day = d["Days"].where(is_test).groupby(w).transform(lambda s: s.dropna().shift(1).reindex(s.index))
+    tw = w[is_test]
+    prev_oil = d.loc[is_test, "Oil_Rate"].groupby(tw).shift(1).reindex(d.index)      # previous test, on test rows
+    prev_day = d.loc[is_test, "Days"].groupby(tw).shift(1).reindex(d.index)
     ref2_oil, ref2_day = _last_before(prev_oil.where(is_test), w), _last_before(prev_day.where(is_test), w)
     d["Test_Trend"] = (d["Ref_Oil"] - ref2_oil) / (d["Ref_Day"] - ref2_day).clip(lower=1) / d["Ref_Oil"].clip(lower=1)
     d["Days_Since_Test"] = d["Days"] - d["Ref_Day"]
@@ -1054,9 +1045,9 @@ class VFMEnsemble:
     def __init__(self, features, n_wells):
         self.features = features
         cat = [features.index("Well_Code")] if n_wells <= 250 else None
-        self.gb = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, max_leaf_nodes=31,
+        self.gb = HistGradientBoostingRegressor(max_iter=120, learning_rate=0.16, max_leaf_nodes=31,
                                                 l2_regularization=1.0, categorical_features=cat, random_state=42)
-        self.et = ExtraTreesRegressor(n_estimators=60, min_samples_leaf=3, max_features=0.5, n_jobs=-1, random_state=42)
+        self.et = ExtraTreesRegressor(n_estimators=30, min_samples_leaf=3, max_features=0.5, n_jobs=1, random_state=42)
 
     def _X(self, d):
         return d[self.features].astype(float).fillna(_MISSING).to_numpy()
@@ -1064,7 +1055,7 @@ class VFMEnsemble:
     def fit(self, d: pd.DataFrame):
         y = (d["Oil_Rate"] / d["Ref_Oil"].clip(lower=1.0)).to_numpy()
         self.gb.fit(self._X(d), y)
-        sub = d.sample(min(len(d), 40000), random_state=42)
+        sub = d.sample(min(len(d), 10000), random_state=42)   # tuned: same blind accuracy, ~2× faster
         self.et.fit(self._X(sub), (sub["Oil_Rate"] / sub["Ref_Oil"].clip(lower=1.0)).to_numpy())
         return self
 
@@ -1173,7 +1164,12 @@ def train_vfm(key: str, _df: pd.DataFrame, interval: int):
 
     final, final_reg = VFMEnsemble(feats, n_wells).fit(known), WellRegression().fit(known)
     est = d[d["Ref_Oil"].notna()].copy()                              # every day after the first test
-    est = est.assign(Pred=_blend_two(final.predict(est), final_reg.predict(est), w_ml), Split=np.where(est["Date"] <= split, "Train", "Validation"), Pred_Unseen=np.nan)
+    raw_pred = _blend_two(final.predict(est), final_reg.predict(est), w_ml)
+    if test_mode and "Hours_On" in est.columns:
+        # tests measure the FLOWING rate; on untested days the daily average = flowing rate × hours on / 24
+        up = (est["Hours_On"].clip(0, 24) / 24).where(est["Oil_Rate"].isna()).fillna(1.0).to_numpy()
+        raw_pred = raw_pred * up
+    est = est.assign(Pred=raw_pred, Split=np.where(est["Date"] <= split, "Train", "Validation"), Pred_Unseen=np.nan)
     est.loc[est.index.intersection(test.index), "Pred_Unseen"] = test["Pred"]
     m = est[est["Oil_Rate"].notna()]
     m = m.assign(_ae=(m["Oil_Rate"] - m["Pred"]).abs(), _aeu=(m["Oil_Rate"] - m["Pred_Unseen"]).abs(),
@@ -1307,20 +1303,39 @@ def screen_equipment(key: str, _df: pd.DataFrame, sensors: tuple):
     sensors = list(sensors)
     if len(sensors) < 2:
         return None, None
-    d = df[["Date", "Well"] + sensors].dropna().sort_values(["Well", "Date"]).reset_index(drop=True)
+    running = pd.Series(True, index=df.index)            # a stopped pump (0 Hz, 0 A, shut-in) is not an anomaly
+    for c in ("Pump_Frequency", "Motor_Current"):
+        if c in df.columns:
+            running &= ~(df[c] <= 0.5)
+    if "Hours_On" in df.columns:
+        running &= ~(df["Hours_On"] < 12)
+    d = df.loc[running, ["Date", "Well"] + sensors].dropna().sort_values(["Well", "Date"]).reset_index(drop=True)
     if len(d) < 40:
         return None, None
+    # Rolling baseline: each reading is compared with the same pump's previous ~60 running days, skipping the last 14
+    # (so a developing fault is not absorbed into "normal"). Slow, natural drift — e.g. lower motor load as the
+    # reservoir declines — is followed; sudden or accelerating changes stand out. A stop of > 5 days (e.g. a pump
+    # change) starts a new baseline, so a new pump is not judged against the old one.
+    W, SKIP = 60, 14
+    seg = d.groupby("Well")["Date"].diff().dt.days.gt(5).groupby(d["Well"]).cumsum()
+    keys = [d["Well"], seg]
     z = np.zeros((len(d), len(sensors)))
-    base = np.zeros(len(d), bool)
-    for _, idx in d.groupby("Well").groups.items():
-        g = d.loc[idx, sensors]
-        n = max(10, int(0.6 * len(g)))
-        b = g.iloc[:n]
-        spread = (b.quantile(0.75) - b.quantile(0.25)) / 1.349
-        spread = spread.where(spread > 1e-9, b.std()).replace(0, 1).fillna(1)
-        z[idx] = ((g - b.median()) / spread).to_numpy()
-        base[idx[:n]] = True
-    iso = IsolationForest(n_estimators=200, random_state=42).fit(z[base])
+    gid = d["Well"].astype(str) + "#" + seg.astype(str)
+    first20 = d.groupby(gid).cumcount() < 20
+    for j, c in enumerate(sensors):
+        roll = d[c].groupby(gid).rolling(W, min_periods=15)
+        def _lag(r):
+            return r.reset_index(level=0, drop=True).sort_index().groupby(gid).shift(SKIP)
+        med, q1, q3 = _lag(roll.median()), _lag(roll.quantile(0.25)), _lag(roll.quantile(0.75))
+        head = d[c].where(first20)                                       # start of a segment: its first readings
+        first_med = head.groupby(gid).transform("median")
+        first_iqr = head.groupby(gid).transform(lambda x: x.quantile(0.75) - x.quantile(0.25))
+        med, iqr = med.fillna(first_med), (q3 - q1).fillna(first_iqr)
+        spread = np.maximum(iqr / 1.349, 0.02 * med.abs() + 1e-6)
+        z[:, j] = ((d[c] - med) / spread).fillna(0.0).to_numpy()
+    pos = d.groupby("Well").cumcount() / d.groupby("Well")["Date"].transform("size")
+    base = (pos < 0.6).to_numpy()
+    iso = IsolationForest(n_estimators=200, random_state=42, n_jobs=1).fit(z[base])
     d["Score"] = -iso.score_samples(z)
     thr = float(np.quantile(d.loc[base, "Score"], 0.995))
     calm = float(np.median(d.loc[base, "Score"]))
@@ -1655,11 +1670,16 @@ def forecast_series(key: str, var: str, H: int, code: str, _series: dict) -> dic
     G = len(grid)
     nonneg = var in NON_NEGATIVE or all((y[np.isfinite(y)] >= 0).all() for y in ys.values())
     need = max(6, min(20, H + 5))                   # real readings needed before a cut
-    origins = [k for k in (1, 2, 3) if G - k * H > 0 and
-               any(np.isfinite(y[:G - k * H]).sum() >= need for y in ys.values())]
+    # blind-test windows end at the last period with readings for a fair share of wells (the current period may be
+    # only a few days old and hold no test yet — scoring against it would be meaningless)
+    counts = np.sum([np.isfinite(y) for y in ys.values()], axis=0)
+    have = np.flatnonzero(counts >= max(1, 0.3 * len(ys)))
+    E = int(have[-1]) + 1 if len(have) else G
+    origins = [k for k in (1, 2, 3) if E - k * H > 0 and
+               any(np.isfinite(y[:E - k * H]).sum() >= need for y in ys.values())]
     cands, actual = {}, {}
     for k in origins + [0]:
-        cut = G - k * H
+        cut = E - k * H if k else G
         hist = {w: y[:cut] for w, y in ys.items() if np.isfinite(y[:cut]).sum() >= (need if k else 3)}
         gb = None
         if not held and len(hist) and sum(np.isfinite(h).sum() for h in hist.values()) >= 60:
@@ -1714,7 +1734,7 @@ def forecast_series(key: str, var: str, H: int, code: str, _series: dict) -> dic
             abs_y += float(np.abs(act[msk]).sum())
             abs_base += float(np.abs(base[msk] - act[msk]).sum())
             acc_w = 100 * (1 - np.abs(pred[msk] - act[msk]).sum() / max(np.abs(act[msk]).sum(), 1e-9))
-            blind[w] = (hist_dates[G - H:], act, pred)
+            blind[w] = (hist_dates[E - H:E], act, pred)
         for k in ks:                                     # error spread by horizon → P10/P90 (real readings only)
             p = _combine(cands[(w, k)], final_w)
             rel = (actual[(w, k)] - p) / np.maximum(np.abs(p), 1e-6)
@@ -1844,258 +1864,6 @@ def steps_from_text(text: str, code: str, default: int) -> int:
 
 
 # ---- 3f. Ask FIELDWISE — answer free-form questions about the uploaded sheet ---------
-LLM_MODELS = {  # API model IDs (platform.claude.com/docs/en/models/overview)
-    "claude-sonnet-5-5": "Sonnet 5.5 — balanced (recommended)",
-    "claude-opus-5-5": "Opus 5.5 — most capable, slower",
-    "claude-haiku-5-5": "Haiku 5.5 — fastest, cheapest",
-}
-LLM_MODEL = "claude-sonnet-5-5"
-
-
-def llm_model() -> str:
-    return st.session_state.get("llm_model") or LLM_MODEL
-
-
-DOMAIN_GUIDE = """You are FIELDWISE, a senior petroleum production engineer and data analyst inside a dashboard.
-Answer the user's question by writing Python that computes the answer from the data. Use your own engineering
-knowledge to decide which columns are needed, even when their names are unusual: read the column names AND the
-sample values/ranges to infer meaning and units, and state any assumption you make in the answer.
-If the question is conceptual (no data needed), just set `answer` to a concise expert explanation.
-
-Variables already loaded (you may also import pandas, numpy, math, statistics, datetime, re, collections,
-itertools, scipy, plotly.express or plotly.graph_objects — nothing else):
-- raw: pandas DataFrame — the uploaded data as one tidy table with the ORIGINAL column names (may be messy;
-  parse with pd.to_numeric(..., errors="coerce") / pd.to_datetime(..., errors="coerce") if needed).
-- df: cleaned, standardised DataFrame. Columns & units: Date (datetime), Well (str), Oil_Rate, Water_Rate (m³/d),
-  Gas_Rate (Sm³/d), Wellhead_Pressure, Bottomhole_Pressure (bar), Injection_Rate (lift gas, Sm³/d or m³/d),
-  plus optional Choke_Size (1/64 in), Pump_Vibration (mm/s), Motor_Temperature (°C), Motor_Current (A),
-  Pump_Frequency (Hz), Energy_kWh (kWh). Prefer df for anything these columns cover; use raw for anything else.
-- ranked: one row per well (latest 7-day averages) with Oil_Rate, Water_Rate, Water_Cut (%), Priority, Why,
-  Status (equipment), Decline (%/yr).
-- decline: per-well Arps decline table.     - pd, np, px, go already imported.
-- forecast(variable, steps=None): FIELDWISE's validated forecasting model. Returns a DataFrame with Well, Date,
-  Step, P10, P50, P90 (P50 = most likely) for the next `steps` periods of the data's own spacing, plus
-  .attrs["accuracy"] = blind-test accuracy %. `variable` is a df column (e.g. "Oil_Rate", "Water_Rate",
-  "Water_Cut", "Liquid_Rate", "Bottomhole_Pressure") or an original raw column name. ALWAYS use it for any
-  prediction / forecast / "next N days/months" question instead of writing your own model; mention the accuracy.
-
-Useful knowledge: water cut = qw/(qo+qw); GOR = qg/qo; WOR = qw/qo; liquid = qo+qw; cumulative volume =
-Σ(rate × days between samples); 1 m³ = 6.2898 bbl; 1 Sm³ = 35.3147 scf; 1 bar = 14.5038 psi;
-productivity index J = q/(Pr − Pwf); drawdown = Pr − Pwf; specific energy = kWh / bbl oil.
-
-Output rules: reply with ONE ```python code block only. The code must set:
-  answer  — a short markdown string with the actual computed numbers (f-strings, sensible rounding, units)
-  result  — a DataFrame/Series/number to show as a table (or None)
-  fig     — optional plotly figure (or None)
-Do not read or write files, use the network, or call to_csv/to_markdown/to_html. Keep it efficient."""
-
-_SAFE_MODULES = {"pandas", "numpy", "math", "statistics", "datetime", "re", "collections", "itertools", "functools",
-                 "scipy", "scipy.stats", "scipy.optimize", "scipy.signal", "scipy.interpolate",
-                 "plotly", "plotly.express", "plotly.graph_objects"}
-
-
-def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
-    if level == 0 and name in _SAFE_MODULES:
-        return builtins.__import__(name, globals, locals, fromlist, level)
-    raise ImportError(f"module '{name}' is not available in FIELDWISE analyses")
-
-
-_SAFE_BUILTINS = {n: getattr(builtins, n) for n in (
-    "abs all any bool callable chr complex dict divmod enumerate filter float format frozenset hasattr hash int "
-    "isinstance issubclass iter len list map max min next object ord pow range repr reversed round set slice "
-    "sorted str sum tuple type zip ArithmeticError AttributeError Exception IndexError KeyError LookupError "
-    "NotImplementedError RuntimeError StopIteration TypeError ValueError ZeroDivisionError True False None").split()}
-_SAFE_BUILTINS.update({"__import__": _safe_import, "__build_class__": builtins.__build_class__})
-_BLOCKED_NAMES = {"open", "exec", "eval", "compile", "input", "globals", "locals", "vars", "getattr", "setattr",
-                  "delattr", "breakpoint", "help", "__import__", "memoryview", "os", "sys", "subprocess"}
-_BLOCKED_ATTR = re.compile(r"^(_|to_(csv|excel|pickle|parquet|sql|json|html|feather|hdf|clipboard|latex|markdown|xml|stata|orc)$|"
-                           r"read_|write|eval$|system$|popen$|save|load$|loadtxt$|fromfile$|tofile$|genfromtxt$|"
-                           r"memmap$|DataSource$|ctypeslib$|io$|os$|sys$|subprocess$|import_module$|builtins$)")
-
-
-def run_safely(code: str, env: dict) -> dict:
-    """Execute model-written analysis code: whitelisted imports only, no private attributes, no file/network access."""
-    tree = ast.parse(code)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise PermissionError("global/nonlocal are not allowed")
-        if isinstance(node, ast.Import) and any(a.name not in _SAFE_MODULES for a in node.names):
-            raise PermissionError("only pandas/numpy/math/statistics/datetime/re/scipy/plotly imports are allowed")
-        if isinstance(node, ast.ImportFrom) and (node.level or node.module not in _SAFE_MODULES):
-            raise PermissionError(f"import from '{node.module}' is not allowed")
-        if isinstance(node, ast.Attribute) and _BLOCKED_ATTR.match(node.attr):
-            raise PermissionError(f"'{node.attr}' is not allowed")
-        if isinstance(node, ast.Name) and (node.id in _BLOCKED_NAMES or node.id.startswith("__")):
-            raise PermissionError(f"'{node.id}' is not allowed")
-    printed = []
-    ns = {"__builtins__": {**_SAFE_BUILTINS, "print": lambda *a, **k: printed.append(" ".join(map(str, a)))},
-          "__name__": "fieldwise_analysis", **env, "answer": None, "result": None, "fig": None}
-    exec(compile(tree, "<fieldwise-analysis>", "exec"), ns)   # noqa: S102 — checked above
-    if not ns.get("answer") and printed:
-        ns["answer"] = "\n\n".join(printed[-20:])
-    return ns
-
-
-def describe_sheet(raw: pd.DataFrame, max_cols: int = 80) -> str:
-    """Compact profile of every column (name, type, fill, range, examples) so the model can infer meaning."""
-    lines = [f"raw: {len(raw):,} rows × {raw.shape[1]} columns"]
-    for col in list(raw.columns)[:max_cols]:
-        v = raw[col]
-        nn = v.notna().mean() * 100
-        if pd.api.types.is_datetime64_any_dtype(v):
-            info = f"dates {v.min():%Y-%m-%d} → {v.max():%Y-%m-%d}"
-        else:
-            num = pd.to_numeric(v, errors="coerce")
-            if num.notna().mean() > 0.8:
-                info = f"numeric min={num.min():.4g} median={num.median():.4g} max={num.max():.4g}"
-            else:
-                info = f"text, {v.nunique()} unique, e.g. {', '.join(map(str, v.dropna().astype(str).unique()[:4]))}"
-        lines.append(f"- {str(col)!r}: {info}; {nn:.0f}% filled")
-    return "\n".join(lines)
-
-
-def _api_key() -> str | None:
-    key = (st.session_state.get("anthropic_key") or "").strip()
-    if key:
-        return key
-    try:
-        key = st.secrets.get("ANTHROPIC_API_KEY")
-    except Exception:  # noqa: BLE001 — no secrets file
-        key = None
-    return (key or os.environ.get("ANTHROPIC_API_KEY") or "").strip() or None
-
-
-def _key_source() -> str:
-    if (st.session_state.get("anthropic_key") or "").strip():
-        return "pasted on this page"
-    try:
-        if st.secrets.get("ANTHROPIC_API_KEY"):
-            return "Streamlit Secrets"
-    except Exception:  # noqa: BLE001
-        pass
-    return "environment variable" if os.environ.get("ANTHROPIC_API_KEY") else ""
-
-
-def sdk_installed() -> bool:
-    try:
-        import anthropic  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def llm_available() -> bool:
-    return sdk_installed() and bool(_api_key())
-
-
-def explain_api_error(exc: Exception, model: str = "") -> str:
-    """Turn an Anthropic API exception into a plain instruction."""
-    status = getattr(exc, "status_code", None)
-    msg = str(getattr(exc, "message", "") or exc)
-    low, name = msg.lower(), type(exc).__name__
-    if status == 402 or "credit balance" in low or "billing" in low:
-        return ("Your Anthropic account has no API credit. Add credit at platform.claude.com → Billing "
-                "(API usage is billed separately from a Claude.ai subscription).")
-    if status == 401 or "authentication" in name.lower() or "x-api-key" in low:
-        return "The API key was rejected. Copy it again from platform.claude.com/settings/keys (it starts with sk-ant-)."
-    if status == 403:
-        return "This API key doesn't have permission for that request — check its workspace in the Claude Console (platform.claude.com)."
-    if status == 404 or "not_found" in low:
-        return f"Model '{model}' isn't available to this key — pick another model below."
-    if status == 429:
-        return "Rate or spend limit reached for this key. Wait a minute, or raise the limit in the Claude Console (platform.claude.com)."
-    if status in (500, 529) or "overloaded" in low:
-        return "Claude is busy right now. Try again in a moment."
-    if "connection" in name.lower() or "timeout" in name.lower():
-        return "This server can't reach api.anthropic.com (no internet access from where the app is running)."
-    return f"{name}: {msg[:220]}"
-
-
-def check_connection(force: bool = False) -> tuple:
-    """One tiny request to confirm the key, credit and model work. Cached per key + model."""
-    if not sdk_installed():
-        return False, "The 'anthropic' package isn't installed on this server — add `anthropic` to requirements.txt and reboot."
-    key, model = _api_key(), llm_model()
-    if not key:
-        return False, "No API key yet."
-    tag = hashlib.md5(f"{key}|{model}".encode()).hexdigest()
-    cache = st.session_state.setdefault("_conn", {})
-    if tag in cache and not force:
-        return cache[tag]
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    result = None
-    for m in [model] + [x for x in LLM_MODELS if x != model]:      # chosen model first, others if it isn't available
-        try:
-            client.messages.create(model=m, max_tokens=5, messages=[{"role": "user", "content": "Reply with OK."}])
-            note_ = "" if m == model else f" ({LLM_MODELS.get(model, model).split(' —')[0]} isn't available to this key)"
-            st.session_state["llm_model"] = m
-            result = (True, f"Connected to Claude · {m}{note_}")
-            break
-        except Exception as exc:  # noqa: BLE001
-            result = (False, explain_api_error(exc, m))
-            if getattr(exc, "status_code", None) != 404:
-                break
-    cache[tag] = result
-    cache[hashlib.md5(f"{key}|{llm_model()}".encode()).hexdigest()] = result
-    return result
-
-
-def _extract_code(text: str) -> str:
-    m = re.search(r"```(?:python)?\s*(.*?)```", text, re.S)
-    return (m.group(1) if m else text).strip()
-
-
-def _call_claude(client, messages, system: str, max_tokens: int):
-    """Call the chosen model; if it isn't available to this key, try the other models once."""
-    model = llm_model()
-    order = [model] + [m for m in LLM_MODELS if m != model]
-    last = None
-    for m in order:
-        try:
-            return client.messages.create(model=m, max_tokens=max_tokens, system=system, messages=messages), m
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            if getattr(exc, "status_code", None) != 404:
-                raise
-    raise last
-
-
-def ask_llm(question: str, f: "Field", env: dict) -> dict:
-    """Claude writes the analysis, FIELDWISE runs it on the real data; up to two automatic self-corrections."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=_api_key(), max_retries=2)
-    ranked, dca = env.get("ranked"), env.get("decline")
-    context = (f"{describe_sheet(f.raw)}\n\ndf: {len(f.df):,} rows, {f.df['Well'].nunique()} wells "
-               f"({', '.join(map(str, sorted(f.df['Well'].unique())[:15]))}), "
-               f"{f.df['Date'].min():%Y-%m-%d} → {f.df['Date'].max():%Y-%m-%d}; columns: {', '.join(map(str, f.df.columns))}.\n"
-               f"ranked columns: {', '.join(map(str, ranked.columns)) if ranked is not None else '—'}.\n"
-               f"decline columns: {', '.join(map(str, dca.columns)) if dca is not None and len(dca) else '—'}.\n"
-               f"Column mapping used (field ← original header): {f.report.get('mapped')}.")
-    messages = [{"role": "user", "content": f"DATA\n{context}\n\nQUESTION\n{question}"}]
-    last_err, used = None, llm_model()
-    for _ in range(3):
-        msg, used = _call_claude(client, messages, DOMAIN_GUIDE, 4000)
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-        code = _extract_code(text)
-        try:
-            ns = run_safely(code, {k: (v.copy() if isinstance(v, pd.DataFrame) else v) for k, v in env.items()})
-            res = ns.get("result")
-            if isinstance(res, (list, dict)) and res:
-                try:
-                    res = pd.DataFrame(res)
-                except ValueError:
-                    res = pd.Series(res)
-            ans = ns.get("answer") or ("Here is the result." if res is not None or ns.get("fig") is not None else "Done.")
-            return {"engine": f"Claude · {used}", "answer": str(ans), "result": res, "fig": ns.get("fig"), "code": code}
-        except Exception as exc:  # noqa: BLE001 — send the error back so the model can fix its code
-            last_err = f"{type(exc).__name__}: {exc}"
-            messages += [{"role": "assistant", "content": text},
-                         {"role": "user", "content": f"Running that code raised {last_err}. "
-                                                     "Fix it and return the full corrected code block only."}]
-    raise RuntimeError(f"Claude's analysis code failed 3 times (last error: {last_err}).")
-
-
 # Offline engine: understands common production questions without any API, and can use ANY numeric column
 _QUANTITIES = [  # (keywords, label, how to compute from a frame, unit, is_rate)
     (("energy per barrel", "per barrel", "kwh per bbl", "kwh/bbl", "kwh bbl", "specific energy", "energy intensity"),
@@ -2215,7 +1983,7 @@ def ask_offline(question: str, f: "Field") -> dict:
             cols = ", ".join(map(str, f.raw.columns[:25]))
             return {"engine": "Offline engine", "result": None, "fig": None,
                     "answer": f"I couldn't tell which data that question needs. Columns in your sheet: {cols}. "
-                              "Try naming one of them, or add an Anthropic API key in Settings for full AI answers."}
+                              "Try naming one of them, e.g. “average <column> per well”."}
         extra = pd.DataFrame({"Date": pd.to_datetime(f.raw[f.report["mapped"]["Date"]], errors="coerce"),
                               "Well": f.raw[f.report["mapped"]["Well"]].astype(str).str.strip().str.upper(),
                               "Value": pd.to_numeric(f.raw[best], errors="coerce")}).dropna()
@@ -2722,6 +2490,14 @@ def page_model(f: Field, vfm):
         table(m, 3)
         card_header("Accuracy by well")
         table(vfm["per_well"], 1, height=250)
+    out = p.assign(Source=np.where(p["Oil_Rate"].notna(), "Measured well test", "AI estimate"))[
+        ["Date", "Well", "Source", "Oil_Rate", "Pred"]].rename(columns={"Oil_Rate": "Measured oil (m³/d)",
+                                                                     "Pred": "AI estimate (m³/d)"})
+    out["AI estimate (bbl/d)"] = out["AI estimate (m³/d)"] * M3_TO_BBL
+    st.download_button("⬇ Download daily oil estimates for every well (CSV)", out.round(3).to_csv(index=False).encode(),
+                       "fieldwise_daily_oil_estimates.csv", "text/csv",
+                       help="Real test values where measured, the AI estimate on every other day — compare with your "
+                            "own allocation or truth data.")
     note("<b>Honest accuracy.</b> Field meters carry ~1–3 % uncertainty, so a model that reproduced history at exactly "
          "100 % would be memorising meter noise and fail on new days. FIELDWISE shows both the full-history match and a "
          "blind test on later dates — the number judges and engineers can trust. Same-day oil, water and gas rates are "
@@ -3122,7 +2898,7 @@ def page_quality(f: Field):
         if r.get("tidy_preview") is not None:
             table(r["tidy_preview"], 2, height=300)
     if r.get("structure_code"):
-        with st.expander("Restructuring code written by Claude"):
+        with st.expander("Restructuring code"):
             st.code(r["structure_code"], language="python")
     a, b = st.columns(2, gap="large")
     with a:
@@ -3192,107 +2968,35 @@ def _render_result(item: dict):
             st.code(item["code"], language="python")
 
 
-def _save_key():
-    st.session_state["anthropic_key"] = (st.session_state.get("anthropic_key_input") or "").strip()
-
-
-def _save_model():
-    st.session_state["llm_model"] = st.session_state.get("llm_model_input") or LLM_MODEL
-
-
-def ai_connection_panel() -> tuple:
-    """Shows whether Claude is connected and, if not, exactly why and how to fix it. Returns (connected, reason)."""
-    ok, why = check_connection() if llm_available() else (False, "")
-    models = list(LLM_MODELS)
-    if ok:
-        note(f"✅ <b>{esc(why)}</b> — answers are written by Claude and calculated on your actual data "
-             f"(key from {esc(_key_source())}).")
-    elif not sdk_installed():
-        note("<b>Claude isn't available on this server</b> — the <code>anthropic</code> package is missing. Add "
-             "<code>anthropic</code> to requirements.txt and reboot the app. Meanwhile the offline engine answers.", warn=True)
-    elif _api_key():
-        note(f"<b>Claude couldn't be reached, so the offline engine is answering.</b><br>{esc(why)}", warn=True)
-    else:
-        note("<b>Claude isn't connected yet, so the offline engine is answering</b> (totals, averages, highs/lows, "
-             "trends, declines, water cut, GOR, WOR per well or field). Paste an Anthropic API key below to let "
-             "Claude answer any question about any column.", warn=True)
-    with st.expander("Claude connection" + (" · connected" if ok else " · set up"), expanded=not ok):
-        c1, c2, c3 = st.columns([2.2, 1.6, 0.9])
-        with c1:
-            st.text_input("Anthropic API key", type="password", key="anthropic_key_input", on_change=_save_key,
-                          value=st.session_state.get("anthropic_key", ""), placeholder="sk-ant-…",
-                          help="Kept only in this browser session. To avoid pasting it each time on Streamlit Cloud: "
-                               "Manage app → Settings → Secrets → ANTHROPIC_API_KEY = \"sk-ant-…\"")
-        with c2:
-            cur = llm_model()
-            st.selectbox("Model", models, index=models.index(cur) if cur in models else 0,
-                         format_func=lambda m: LLM_MODELS[m], key="llm_model_input", on_change=_save_model)
-        with c3:
-            st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
-            if st.button("Test", **W):
-                _save_key()
-                _save_model()
-                ok, why = check_connection(force=True)
-                (st.success if ok else st.error)(why)
-        st.caption("Get a key at platform.claude.com/settings/keys, and add a little credit under Billing — "
-                   "each question costs a fraction of a cent.")
-    return ok, why
-
-
 @_fragment
 def page_ask(f: Field, ranked, dca):
-    page_header("Ask FIELDWISE", "Ask anything about your data in plain English — including columns the dashboard "
-                "does not use. FIELDWISE works out which data it needs, calculates on the real numbers and shows how.",
-                f"Claude · {llm_model()}" if llm_available() else "Offline engine")
-    smart, why_not = ai_connection_panel()
+    page_header("Ask FIELDWISE", "Ask simple questions about your data in plain English. Answers are calculated "
+                "instantly on your real numbers — fully offline, free and unlimited.", "Offline engine")
+    note("<b>What you can ask</b> — mention a measurement (oil, water, gas, water cut, GOR, pressure, lift gas, "
+         "choke, vibration, temperature, current, energy, or any column name from your file), and optionally a well "
+         "(e.g. <i>W-003</i>) and a period (<i>last 30 days</i>, <i>2025</i>).<br>"
+         "• <b>Totals / averages:</b> “Total oil produced by each well”, “Average water cut per well”<br>"
+         "• <b>Highest / lowest:</b> “Which well has the highest GOR?”, “Lowest bottom-hole pressure”<br>"
+         "• <b>Trends:</b> “Show the oil rate trend of W-003”<br>"
+         "• <b>Declines:</b> “Which wells are declining?”<br>"
+         "• <b>Predictions:</b> “Predict oil production for the next 30 days”")
     st.caption("Try one:")
     cols = st.columns(3)
     for i, ex in enumerate(EXAMPLE_QUESTIONS):
         with cols[i % 3]:
             if st.button(ex, key=f"ex_{i}", **W):
                 st.session_state["ask_q"] = ex.replace("the top-priority well", str(ranked.iloc[0]["Well"]))
-    q = st.text_input("Your question", key="ask_q", placeholder="e.g. Which well had the biggest drop in oil last month?")
+    q = st.text_input("Your question", key="ask_q", placeholder="e.g. Which well has the highest water cut?")
     if st.button("Ask", type="primary") and q.strip():
-        env = {"raw": f.raw, "df": f.df, "ranked": ranked, "decline": dca, "pd": pd, "np": np, "px": px, "go": go,
-               "forecast": make_forecast_tool(f)}
-        with st.spinner("Claude is working out the answer…" if smart else "Calculating…"):
-            out, reason = None, (why_not if (not smart and _api_key()) else None)
-            if smart:
-                try:
-                    out = ask_llm(q, f, env)
-                except Exception as exc:  # noqa: BLE001 — fall back to the offline engine, but say exactly why
-                    reason = explain_api_error(exc, llm_model()) if hasattr(exc, "status_code") or \
-                        "anthropic" in type(exc).__module__ else str(exc)
-            if out is None:
-                try:
-                    out = ask_offline(q, f)
-                except Exception as exc:  # noqa: BLE001
-                    out = {"engine": "Offline engine", "answer": f"Sorry — I could not compute that ({exc}).",
-                           "result": None, "fig": None}
-                if reason:
-                    out["engine"] = f"Offline engine — Claude unavailable: {reason}"
+        with st.spinner("Calculating…"):
+            try:
+                out = ask_offline(q, f)
+            except Exception as exc:  # noqa: BLE001
+                out = {"engine": "Offline engine", "answer": f"Sorry — I could not compute that ({exc}). Try rephrasing "
+                       "with a measurement name, e.g. “average oil rate per well”.", "result": None, "fig": None}
         st.session_state.setdefault("ask_history", []).insert(0, {"q": q, **out})
     for item in st.session_state.get("ask_history", [])[:6]:
         _render_result(item)
-
-
-def make_forecast_tool(f: Field):
-    """forecast(variable, steps) for Claude-written analyses — runs the validated forecasting engine."""
-    code, _ = detect_frequency(f.df)
-    d, opts = forecastable(f)
-
-    def forecast(variable: str, steps: int | None = None) -> pd.DataFrame:
-        var = str(variable)
-        if var not in d.columns:
-            var = f"x::{variable}" if f"x::{variable}" in d.columns else next(
-                (k for k, lab in opts.items() if lab.lower().startswith(str(variable).lower())), var)
-        r = run_forecast(f, var, int(steps or DEFAULT_STEPS.get(code, 12)), d)
-        if r is None:
-            raise ValueError(f"cannot forecast '{variable}' — choose one of: {', '.join(k.replace('x::', '') for k in opts)}")
-        out = r["fc"].drop(columns=["Method"]).copy()
-        out.attrs["accuracy"] = r["accuracy"]
-        return out
-    return forecast
 
 
 def page_method():
@@ -3348,10 +3052,12 @@ FIELD_LABELS = {
     "Injection_Rate": "Lift-gas rate", "Choke_Size": "Choke size", "Pump_Vibration": "Pump vibration",
     "Motor_Temperature": "Motor temperature", "Motor_Current": "Motor current", "Pump_Frequency": "Pump frequency",
     "Energy_kWh": "Energy use", "Water_Cut": "Water cut", "Liquid_Rate": "Gross liquid rate", "GOR": "Gas-oil ratio",
+    "Hours_On": "Hours on",
 }
 FIELD_GROUPS = [
     ("Essential", ["Date", "Well", "Oil_Rate"]),
-    ("Production", ["Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate", "Choke_Size"]),
+    ("Production", ["Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate", "Choke_Size",
+                    "Hours_On"]),
     ("Pump / equipment", SENSOR_COLUMNS),
     ("Helpers — used to calculate missing rates", AUX_COLUMNS),
 ]
@@ -3460,12 +3166,12 @@ def sidebar_upload():
         return None, f"Could not read {up.name}: {exc}"
     stem = os.path.splitext(up.name)[0]
     try:
-        raw, s_log, s_code = structure_cached(token, grids, stem, llm_available())
+        raw, s_log, s_code = structure_cached(token, grids, stem)
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not understand the layout of {up.name}: {exc}"
     if raw is None:
         return None, ("Could not find a time-series table in this file. " + " ".join(s_log[-2:]) +
-                      " Connect Claude on the Ask FIELDWISE page to let it restructure unusual layouts.")
+                      " Check that the file has a date column and one row per well per date (see the template).")
     sheet = "auto"
     auto, how = infer_cached(f"{token}|{sheet}", raw)
     mapping, manual = sidebar_columns(token, raw, auto, how)
@@ -3503,15 +3209,6 @@ def sidebar_upload():
                  key=key, raw=raw), None
 
 
-def sidebar_ai():
-    if llm_available():
-        ok, _ = check_connection()          # cached per key + model: one tiny request per session
-        state = f"Claude connected ({llm_model()})" if ok else "key not working — see Ask FIELDWISE"
-    else:
-        state = "offline engine — connect Claude on Ask FIELDWISE"
-    st.sidebar.caption(f"🤖 AI assistant: {state}")
-
-
 def sidebar_settings() -> Settings:
     with st.sidebar.expander("Settings", expanded=False):
         return Settings(test_interval=st.select_slider("Well-test interval (observations)", options=[7, 14, 21, 30], value=14),
@@ -3539,11 +3236,10 @@ def main():
         return
 
     settings = sidebar_settings()
-    sidebar_ai()
     if any(str(x).startswith("⚠") for x in field.report.get("structure_log", [])):
         st.warning("FIELDWISE is not fully sure how this file is organised — see **Data & Quality → Automatic "
-                   "restructuring** and check the Before/After preview. Adding an Anthropic API key lets Claude "
-                   "restructure unusual layouts automatically.")
+                   "restructuring** and check the Before/After preview. If it looks wrong, reshape the file to one row per "
+                   "well per date (see the template).")
     field.report = {**field.report, "interval": settings.test_interval, "co2": settings.co2, "oil_price": settings.oil_price}
     page = st.sidebar.radio("Navigate", list(PAGES), format_func=lambda p: f"{PAGES[p]}  {p}")
     st.sidebar.markdown(footer, unsafe_allow_html=True)
