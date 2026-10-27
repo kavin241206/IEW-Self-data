@@ -88,12 +88,12 @@ DESCRIPTIONS = {
 
 ALIASES = {
     "Date": ["date", "datetime", "timestamp", "time", "sample date", "observation date", "production date"],
-    "Well": ["well", "well id", "well name", "wellno", "well no", "uwi", "api", "well identifier"],
-    "Oil_Rate": ["oil rate", "oil", "oil production", "oil production rate", "qo", "oil m3 d", "oil rate (m3/d)",
+    "Well": ["well", "well id", "well name", "wellbore", "well bore", "well bore code", "wellbore name", "wellno", "well no", "uwi", "api", "well identifier"],
+    "Oil_Rate": ["oil rate", "oil", "bore oil vol", "oil vol", "oil volume", "net oil", "oil production", "oil production rate", "qo", "oil m3 d", "oil rate (m3/d)",
                  "oil rate (m³/d)", "bopd", "oil bopd"],
-    "Water_Rate": ["water rate", "water", "water production", "water production rate", "qw", "water m3 d",
+    "Water_Rate": ["water rate", "water", "bore wat vol", "wat vol", "water vol", "water volume", "water production", "water production rate", "qw", "water m3 d",
                    "water rate (m3/d)", "water rate (m³/d)", "bwpd"],
-    "Gas_Rate": ["gas rate", "gas", "gas production", "gas production rate", "qg", "gas mscf d", "gas rate (mcf/d)"],
+    "Gas_Rate": ["gas rate", "gas", "bore gas vol", "gas vol", "gas volume", "gas production", "gas production rate", "qg", "gas mscf d", "gas rate (mcf/d)"],
     "Wellhead_Pressure": ["wellhead pressure", "whp", "tubing head pressure", "thp", "well head pressure", "fthp"],
     "Bottomhole_Pressure": ["bottomhole pressure", "bottom hole pressure", "bhp", "flowing bottomhole pressure",
                             "fbhp", "pwf", "downhole pressure"],
@@ -166,7 +166,7 @@ _KEYWORDS = [
     ("Wellhead_Pressure", ("wellhead", "well head", "tubing head", "thp", "whp")),
     ("Pump_Vibration", ("vibration",)), ("Motor_Temperature", ("motor temp", "winding temp")),
     ("Motor_Current", ("amps", "current")), ("Pump_Frequency", ("frequency", "freq", "hz", "vfd", "vsd")),
-    ("Energy_kWh", ("kwh", "energy", "power")), ("Water_Rate", ("water", "bwpd", "qw")),
+    ("Energy_kWh", ("kwh", "energy", "power")), ("Water_Rate", ("water", "bwpd", "qw", "wat vol", "wat rate", "wtr")),
     ("Gas_Rate", ("gas", "qg", "mscf")), ("Oil_Rate", ("oil", "bopd", "qo", "crude")),
     ("Well", ("well",)), ("Date", ("date", "time", "day")),
 ]
@@ -197,6 +197,15 @@ def infer_columns(raw: pd.DataFrame):
     Returns ({field: source column}, {field: how it was recognised})."""
     cols = [c for c in raw.columns if str(c).strip() and not str(c).lower().startswith("unnamed")]
     mapped, how, used = {}, {}, set()
+    sample = raw.head(300)
+
+    def numeric_ok(col):   # a measurement column must hold numbers
+        v = sample[col].dropna()
+        return len(v) == 0 or pd.api.types.is_numeric_dtype(v) or _to_number(v).notna().mean() > 0.8
+
+    def not_a_level(col):  # 'DP choke', 'delta P', 'choke UOM' are a difference or a unit label, not the quantity
+        t = _norm(col).split()
+        return any(w in t for w in ("dp", "delta", "diff", "differential", "uom", "unit", "units", "flag", "code"))
 
     def take(field, col, reason):
         mapped[field], how[field] = str(col), reason
@@ -210,17 +219,17 @@ def infer_columns(raw: pd.DataFrame):
         if canon in mapped:
             continue
         hits = [c for c in cols if c not in used and any(w in _strip_units(c) for w in words)
-                and (canon in AUX_COLUMNS or not ("ratio" in _norm(c) or "cut" in _norm(c) or "cum" in _norm(c).split()))]
+                and (canon in AUX_COLUMNS or not ("ratio" in _norm(c) or "cut" in _norm(c) or "cum" in _norm(c).split()))
+                and (canon in ("Date", "Well") or (numeric_ok(c) and not not_a_level(c)))]
         if len(hits) == 1:
             take(canon, hits[0], "keyword in header")
     names = {_strip_units(a): canon for canon, al in ALIASES.items() for a in [canon, *al] if len(_strip_units(a)) > 3}
     for col in cols:                                    # 3) similar spelling (typos, abbreviations)
-        if col in used:
+        if col in used or not_a_level(col):
             continue
         best = difflib.get_close_matches(_strip_units(col), list(names), n=1, cutoff=0.82)
         if best and names[best[0]] not in mapped:
             take(names[best[0]], col, f"similar to '{best[0]}'")
-    sample = raw.head(300)
     if "Date" not in mapped:                            # 4) content: a column whose values are dates
         for col in cols:
             if col in used:
@@ -299,11 +308,71 @@ def derive_fields(frame: pd.DataFrame, rep: dict) -> pd.DataFrame:
     return frame.drop(columns=[c for c in AUX_COLUMNS if c in frame.columns])
 
 
+_INJ_WORDS = {"injection", "injector", "inj", "wi", "gi", "wag", "water injection", "gas injection", "disposal", "wdw"}
+_PROD_WORDS = {"production", "producer", "prod", "op", "oil producer", "oil", "gp", "gas producer", "producing"}
+
+
+SIG = "Sig: "          # prefix for extra continuous signals carried from the file (e.g. choke ΔP, wellhead temperature)
+_LEAKY = ("oil", "gas", "water", "wat", "liquid", "fluid", "gor", "wor", "glr", "cut", "bsw", "cum", "vol", "rate",
+          "prod", "inj", "wi", "gi", "bopd", "bwpd", "mscf", "bbl", "stb", "sm3", "m3", "total", "allocated", "code", "id")
+
+
+def extra_signals(raw: pd.DataFrame, used: set, max_n: int = 12) -> list:
+    """Other numeric columns that look like continuous measurements (temperatures, ΔP, annulus pressure …).
+    Anything that could be a production volume / ratio is excluded, so the model can never peek at the answer."""
+    out = []
+    wells = None
+    for col in raw.columns:
+        if col in used or str(col).strip() == "" or len(out) >= max_n:
+            continue
+        toks = set(_strip_units(col).split()) | set(_norm(col).split())
+        if toks & set(_LEAKY) or any(t.startswith(("oil", "gas", "water", "liquid")) for t in toks):
+            continue
+        v = _to_number(raw[col])
+        if v.notna().mean() < 0.3 or v.nunique() < 10:
+            continue
+        if wells is None:
+            wcol = next((c for c in raw.columns if str(c) == "Well"), None)
+            wells = raw[wcol].astype(str) if wcol is not None else pd.Series("all", index=raw.index)
+        if v.groupby(wells).nunique().max() <= 3:          # constant per well → an ID or a property, not a signal
+            continue
+        out.append(col)
+    return out
+
+
+def split_injection_rows(raw: pd.DataFrame):
+    """Real exports often mix injector rows into the production table (e.g. FLOW_KIND = injection / production,
+    WELL_TYPE = WI / OP). Returns (rows to analyse, column used, rows removed) — production rows only."""
+    best = None
+    for col in raw.columns:
+        v = raw[col]
+        if pd.api.types.is_numeric_dtype(v) or pd.api.types.is_datetime64_any_dtype(v):
+            continue
+        low = v.dropna().astype(str).str.strip().str.lower()
+        if low.empty or low.nunique() > 6:
+            continue
+        kinds = set(low.unique())
+        inj, prod = kinds & _INJ_WORDS, kinds & _PROD_WORDS
+        if inj and prod and kinds <= (_INJ_WORDS | _PROD_WORDS):
+            score = 2 if ("flow" in _norm(col) or "injection" in kinds) else 1   # FLOW_KIND beats WELL_TYPE
+            if best is None or score > best[0]:
+                best = (score, col, inj)
+    if best is None:
+        return raw, None, 0
+    _, col, inj = best
+    drop = raw[col].astype(str).str.strip().str.lower().isin(inj)
+    return raw.loc[~drop], str(col), int(drop.sum())
+
+
 def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = None):
     """Auditable cleaning. Only Date, Well and Oil rate are strictly required (oil may be derived).
     Returns (clean frame | None, report)."""
+    raw, inj_col, inj_rows = split_injection_rows(raw)
     frame, mapped, ignored = map_columns(raw, mapping)
-    rep = {"input_rows": len(raw), "mapped": mapped, "ignored": ignored, "bad_keys": 0, "duplicates": 0,
+    extras = extra_signals(raw, set(map(str, mapped.values())) | set(mapped.values()))
+    for col in extras:
+        frame[SIG + str(col)] = _to_number(raw[col]).to_numpy()
+    rep = {"injection_rows_removed": (inj_col, inj_rows) if inj_rows else None, "input_rows": len(raw), "mapped": mapped, "ignored": ignored, "bad_keys": 0, "duplicates": 0,
            "invalid": 0, "imputed": {}, "capped": 0, "dropped_optional": [], "conversions": [],
            "injection_missing": False, "derived": [], "absent": []}
     missing = [c for c in ["Date", "Well"] if c not in frame.columns]
@@ -346,13 +415,22 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = Non
     if "Injection_Rate" not in frame.columns:
         frame["Injection_Rate"] = 0.0
         rep["injection_missing"] = True
-    numeric = [c for c in NUMERIC_COLUMNS if c in frame.columns]
+    numeric = [c for c in NUMERIC_COLUMNS if c in frame.columns] + [c for c in frame.columns if str(c).startswith(SIG)]
+    rep["extra_signals"] = [c[len(SIG):] for c in frame.columns if str(c).startswith(SIG)]
     miss_frac = {c: float(frame[c].isna().mean()) for c in numeric}
 
     for col in [c for c in RATE_COLUMNS + PRESSURE_COLUMNS + SETPOINTS if c in frame.columns]:
         bad = frame[col] < 0
         rep["invalid"] += int(bad.sum())
         frame.loc[bad, col] = np.nan
+    # A pressure of exactly 0 while the well is flowing is a dead gauge, not a real reading
+    flowing = (frame["Hours_On"] >= 12) if "Hours_On" in frame.columns else (frame["Oil_Rate"] > 0)
+    rep["dead_gauge"] = {}
+    for col in [c for c in PRESSURE_COLUMNS if c in frame.columns]:
+        dead = flowing & (frame[col] == 0)
+        if dead.sum():
+            rep["dead_gauge"][col] = int(dead.sum())
+            frame.loc[dead, col] = np.nan
 
     for col in [c for c in OPTIONAL_COLUMNS if c in frame.columns]:
         best_well = frame[col].notna().groupby(frame["Well"]).mean().max() if len(frame) else 0
@@ -426,6 +504,11 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = Non
             rep["absent"].append(col)
     # Keep every row that holds at least one real measurement (sensor-only days are valuable between well tests)
     frame = frame.dropna(subset=[c for c in numeric if c in frame.columns], how="all").reset_index(drop=True)
+    # Wells that never produced oil (injectors, observation wells) are set aside from production analysis
+    producing = (frame["Oil_Rate"] > 0).groupby(frame["Well"]).any()
+    rep["non_producers"] = sorted(producing.index[~producing])
+    if rep["non_producers"] and producing.any():
+        frame = frame[frame["Well"].isin(producing.index[producing])].reset_index(drop=True)
     n_oil = int(frame["Oil_Rate"].notna().sum())
     if n_oil < 10:
         rep["error"] = f"Only {n_oil} oil-rate measurements found — at least 10 are needed."
@@ -1003,8 +1086,9 @@ def _add_reference(d: pd.DataFrame, interval: int, test_mode: bool) -> pd.DataFr
     measured = d["Oil_Rate"].notna()
     if test_mode:
         is_test = measured
-    else:
-        k = d.loc[measured].groupby("Well").cumcount()
+    else:   # simulated tests are taken the way real ones are: on days the well is flowing
+        eligible = measured & (d["Oil_Rate"] > 0)
+        k = d.loc[eligible].groupby("Well").cumcount()
         is_test = pd.Series(False, index=d.index)
         is_test.loc[k.index] = (k % interval == 0).to_numpy()
     d["Is_Test"] = is_test
@@ -1023,6 +1107,13 @@ def _add_reference(d: pd.DataFrame, interval: int, test_mode: bool) -> pd.DataFr
     d["Days_Since_Test"] = d["Days"] - d["Ref_Day"]
     d["dBHP_Since_Test"] = d["Bottomhole_Pressure"] - d["Ref_BHP"]
     d["dWHP_Since_Test"] = d["Wellhead_Pressure"] - d["Ref_WHP"]
+    # how far every other continuous signal has moved since the last test (choke, ΔP, temperatures …):
+    # oil changes when the conditions change, so these 'since-test' moves are the strongest real-field clues
+    for c in ["Choke_Size", "Injection_Rate"] + [c for c in d.columns if str(c).startswith(SIG)]:
+        if c in d.columns and d[c].notna().any():
+            ref = _last_before(d[c].where(is_test), w)
+            d["Δ " + c] = d[c] - ref
+            d["÷ " + c] = d[c] / ref.where(ref.abs() > 1e-6)
     d["Well_Code"] = d["Well"].astype("category").cat.codes
     return d
 
@@ -1032,7 +1123,8 @@ def vfm_features(d: pd.DataFrame) -> list:
          "Ref_Oil", "Ref_WC", "Ref_Liquid", "Days_Since_Test", "dBHP_Since_Test", "dWHP_Since_Test", "Test_Trend"]
     if "Choke_Size" in d.columns:
         f.insert(3, "Choke_Size")
-    return f + [c for c in ("Motor_Current", "Pump_Frequency", "Motor_Temperature") if c in d.columns]
+    return f + [c for c in ("Motor_Current", "Pump_Frequency", "Motor_Temperature") if c in d.columns] \
+        + [c for c in d.columns if str(c).startswith((SIG, "Δ ", "÷ "))]
 
 
 _MISSING = -999.0     # trees treat this as "signal not recorded"; nothing is invented for the gap
@@ -1045,7 +1137,7 @@ class VFMEnsemble:
     def __init__(self, features, n_wells):
         self.features = features
         cat = [features.index("Well_Code")] if n_wells <= 250 else None
-        self.gb = HistGradientBoostingRegressor(max_iter=120, learning_rate=0.16, max_leaf_nodes=31,
+        self.gb = HistGradientBoostingRegressor(max_iter=120, learning_rate=0.16, max_leaf_nodes=31, loss="absolute_error",
                                                 l2_regularization=1.0, categorical_features=cat, random_state=42)
         self.et = ExtraTreesRegressor(n_estimators=30, min_samples_leaf=3, max_features=0.5, n_jobs=1, random_state=42)
 
@@ -1054,6 +1146,8 @@ class VFMEnsemble:
 
     def fit(self, d: pd.DataFrame):
         y = (d["Oil_Rate"] / d["Ref_Oil"].clip(lower=1.0)).to_numpy()
+        self.seen = d["Well"].value_counts()
+        self.lo, self.hi = np.nanquantile(y, [0.005, 0.995]) if len(y) else (0.0, 10.0)
         self.gb.fit(self._X(d), y)
         sub = d.sample(min(len(d), 10000), random_state=42)   # tuned: same blind accuracy, ~2× faster
         self.et.fit(self._X(sub), (sub["Oil_Rate"] / sub["Ref_Oil"].clip(lower=1.0)).to_numpy())
@@ -1061,11 +1155,14 @@ class VFMEnsemble:
 
     def predict(self, d: pd.DataFrame) -> np.ndarray:
         X = self._X(d)
-        ratio = 0.5 * self.gb.predict(X) + 0.5 * self.et.predict(X)
-        return np.maximum(ratio, 0) * d["Ref_Oil"].clip(lower=1.0).to_numpy()
+        ratio = np.clip(0.5 * self.gb.predict(X) + 0.5 * self.et.predict(X), max(self.lo, 0.0), self.hi)
+        # a well the model has (almost) never seen: no learned behaviour yet → hold its last test
+        new = d["Well"].map(self.seen).fillna(0).to_numpy() < 5
+        ratio = np.where(new, 1.0, ratio)
+        return ratio * d["Ref_Oil"].clip(lower=1.0).to_numpy()
 
 
-RIDGE_SIGNALS = ["Bottomhole_Pressure", "Wellhead_Pressure", "Injection_Rate", "Choke_Size", "Days",
+RIDGE_SIGNALS = ["Bottomhole_Pressure", "Wellhead_Pressure", "Injection_Rate", "Choke_Size",
                  "Motor_Current", "Pump_Frequency"]
 
 
@@ -1089,7 +1186,7 @@ class WellRegression:
             pen = np.eye(Z.shape[1]) * self.lam
             pen[0, 0] = 0.0
             beta = np.linalg.solve(Z.T @ Z + pen, Z.T @ g["Oil_Rate"].to_numpy(float))
-            self.models[w] = (cols, mu, sd, beta)
+            self.models[w] = (cols, mu, sd, beta, 1.5 * float(g["Oil_Rate"].max()))
         return self
 
     def predict(self, rows: pd.DataFrame) -> np.ndarray:
@@ -1097,17 +1194,29 @@ class WellRegression:
         for w, idx in rows.groupby("Well").indices.items():
             if w not in self.models:
                 continue
-            cols, mu, sd, beta = self.models[w]
+            cols, mu, sd, beta, cap = self.models[w]
             A = rows.iloc[idx][cols].astype(float)
             Z = np.column_stack([np.ones(len(A)), ((A - mu) / sd).fillna(0.0).to_numpy()])   # missing signal → neutral
-            out[idx] = np.maximum(Z @ beta, 0.0)
+            out[idx] = np.clip(Z @ beta, 0.0, cap)                 # never beyond what the well has ever done
         return out
 
 
-def _blend_two(a: np.ndarray, b: np.ndarray, wa: float) -> np.ndarray:
-    """wa·a + (1−wa)·b, falling back to whichever estimate exists."""
-    out = wa * a + (1 - wa) * b
-    return np.where(np.isnan(b), a, np.where(np.isnan(a), b, out))
+def _mix(P: np.ndarray, w) -> np.ndarray:
+    """Weighted mix of the estimate columns in P; a missing estimate gives its weight to the others."""
+    w = np.asarray(w, float)
+    W = np.where(np.isnan(P), 0.0, w)
+    tot = W.sum(1)
+    out = (np.nan_to_num(P) * W).sum(1) / np.where(tot > 0, tot, 1.0)
+    return np.where(tot > 0, out, P[:, 0])
+
+
+_WEIGHT_GRID = [(a / 10, b / 10, (10 - a - b) / 10) for a in range(11) for b in range(11 - a)]
+
+
+def _best_weights(P: np.ndarray, y: np.ndarray):
+    """Weights (AI, regression, last test) with the lowest absolute error on an OLDER hold-out window."""
+    errs = [np.abs(_mix(P, w) - y).sum() for w in _WEIGHT_GRID]
+    return _WEIGHT_GRID[int(np.argmin(errs))]
 
 
 def _scores(y, p) -> dict:
@@ -1123,7 +1232,16 @@ def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     """Learns oil rate ONLY from rows where oil was really measured; scores on later, unseen measurements;
     then estimates oil for every day — including days with no test — from the continuous signals."""
     test_mode = is_test_mode(_df)
-    d = _add_reference(enrich(_df), interval, test_mode)
+    src = _df
+    # Daily VOLUMES on partly-shut-in days (e.g. 6 h on stream) are not the well's rate. With an hours-on column the
+    # model learns the FLOWING rate (volume × 24 / hours) and converts back to the day's volume at the end.
+    hours_basis = (not test_mode and "Hours_On" in src.columns and src["Hours_On"].notna().mean() > 0.5
+                   and (src["Hours_On"] < 23.5).mean() > 0.02)
+    if hours_basis:
+        h = src["Hours_On"].clip(0, 24)
+        k = (24.0 / h).where(h >= 6)
+        src = src.assign(Oil_Daily=src["Oil_Rate"], Oil_Rate=src["Oil_Rate"] * k, Water_Rate=src["Water_Rate"] * k, Gas_Rate=src["Gas_Rate"] * k)
+    d = _add_reference(enrich(src), interval, test_mode)
     feats = [c for c in vfm_features(d) if d[c].notna().mean() > 0.3]
     known = d[d["Oil_Rate"].notna() & d["Ref_Oil"].notna()]          # real targets only
     split = known["Date"].quantile(0.8)
@@ -1131,30 +1249,37 @@ def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     if len(train) < 20 or len(test) < 5:
         raise ValueError("Not enough measured oil rates for a chronological train/test split.")
     n_wells = d["Well"].nunique()
-    val_model = VFMEnsemble(feats, n_wells).fit(train)
-    val_reg = WellRegression().fit(train)
-    p_ml, p_reg = val_model.predict(test), val_reg.predict(test)
-    # weight the two models by their error on the unseen later tests (inverse-MAE)
-    y = test["Oil_Rate"].to_numpy()
-    both = ~np.isnan(p_reg)
-    if both.sum() >= 5:
-        e_ml, e_reg = np.mean(np.abs(p_ml[both] - y[both])), np.mean(np.abs(p_reg[both] - y[both]))
-        w_ml = (1 / (e_ml + 1e-9)) / (1 / (e_ml + 1e-9) + 1 / (e_reg + 1e-9))
+
+    def members(fit_rows, rows):
+        mdl, reg = VFMEnsemble(feats, n_wells).fit(fit_rows), WellRegression().fit(fit_rows)
+        return mdl, reg, np.column_stack([mdl.predict(rows), reg.predict(rows), rows["Ref_Oil"].to_numpy(float)])
+
+    # Blend weights are chosen on an OLDER window (64–80 % of the history), so the score on the last 20 % is a
+    # genuine blind test. Holding the last test is a candidate too: on erratic real wells it can earn weight.
+    inner = known["Date"].quantile(0.64)
+    tr_i, va_i = train[train["Date"] <= inner], train[train["Date"] > inner]
+    if len(tr_i) >= 20 and len(va_i) >= 5:
+        weights = _best_weights(members(tr_i, va_i)[2], va_i["Oil_Rate"].to_numpy(float))
     else:
-        w_ml = 1.0
-    test = test.assign(Pred=_blend_two(p_ml, p_reg, w_ml), Pred_ML=p_ml, Pred_Reg=p_reg)
+        weights = (0.5, 0.5, 0.0)
+    w_ml = weights[0]
+    val_model, val_reg, P = members(train, test)
+    p_ml, p_reg = P[:, 0], P[:, 1]
+    both = ~np.isnan(p_reg)
+    test = test.assign(Pred=_mix(P, weights), Pred_ML=p_ml, Pred_Reg=p_reg)
     span = (test["Next_Day"] - test["Ref_Day"]).replace(0, np.nan)
     interp = test["Ref_Oil"] + (test["Next_Oil"] - test["Ref_Oil"]) * (test["Days"] - test["Ref_Day"]) / span
     has_i = interp.notna()
     rows = [
-        {"Dataset": "Training (seen)", **_scores(train["Oil_Rate"], _blend_two(val_model.predict(train), val_reg.predict(train), w_ml)),
+        {"Dataset": "Training (seen)", **_scores(train["Oil_Rate"], _mix(np.column_stack(
+            [val_model.predict(train), val_reg.predict(train), train["Ref_Oil"].to_numpy(float)]), weights)),
          "Rows": len(train)},
         {"Dataset": "Validation (unseen later measurements)", **_scores(test["Oil_Rate"], test["Pred"]), "Rows": len(test)},
-        {"Dataset": "Baseline · carry last well test", **_scores(test["Oil_Rate"], test["Ref_Oil"]), "Rows": len(test)},
+        {"Dataset": "Baseline · carry last well test" + (f" (blend weight {weights[2]:.0%})" if weights[2] else ""), **_scores(test["Oil_Rate"], test["Ref_Oil"]), "Rows": len(test)},
         {"Dataset": f"  ↳ boosted trees alone (weight {w_ml:.0%})", **_scores(test["Oil_Rate"], test["Pred_ML"]), "Rows": len(test)},
     ]
     if both.sum() >= 5:
-        rows.append({"Dataset": f"  ↳ per-well regression alone (weight {1 - w_ml:.0%})",
+        rows.append({"Dataset": f"  ↳ per-well regression alone (weight {weights[1]:.0%})",
                      **_scores(test.loc[both, "Oil_Rate"], test.loc[both, "Pred_Reg"]), "Rows": int(both.sum())})
     if has_i.sum() >= 5:
         rows.append({"Dataset": "Baseline · interpolate between tests (needs the NEXT test)",
@@ -1162,15 +1287,19 @@ def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     metrics = pd.DataFrame(rows)
     importance = pd.DataFrame({"Feature": feats, "Importance": val_model.et.feature_importances_})
 
-    final, final_reg = VFMEnsemble(feats, n_wells).fit(known), WellRegression().fit(known)
     est = d[d["Ref_Oil"].notna()].copy()                              # every day after the first test
-    raw_pred = _blend_two(final.predict(est), final_reg.predict(est), w_ml)
+    final, final_reg, P_all = members(known, est)
+    raw_pred = _mix(P_all, weights)
+    up = np.ones(len(est))
     if test_mode and "Hours_On" in est.columns:
         # tests measure the FLOWING rate; on untested days the daily average = flowing rate × hours on / 24
         up = (est["Hours_On"].clip(0, 24) / 24).where(est["Oil_Rate"].isna()).fillna(1.0).to_numpy()
-        raw_pred = raw_pred * up
-    est = est.assign(Pred=raw_pred, Split=np.where(est["Date"] <= split, "Train", "Validation"), Pred_Unseen=np.nan)
-    est.loc[est.index.intersection(test.index), "Pred_Unseen"] = test["Pred"]
+    elif hours_basis:      # back from flowing rate to the day's volume, on every day
+        up = (est["Hours_On"].clip(0, 24) / 24).fillna(1.0).to_numpy()
+        est["Oil_Rate"] = est["Oil_Daily"]
+    est = est.assign(Pred=raw_pred * up, Split=np.where(est["Date"] <= split, "Train", "Validation"), Pred_Unseen=np.nan)
+    tix = est.index.intersection(test.index)
+    est.loc[tix, "Pred_Unseen"] = test.loc[tix, "Pred"] * pd.Series(up, index=est.index).loc[tix]
     m = est[est["Oil_Rate"].notna()]
     m = m.assign(_ae=(m["Oil_Rate"] - m["Pred"]).abs(), _aeu=(m["Oil_Rate"] - m["Pred_Unseen"]).abs(),
                  _yu=m["Oil_Rate"].where(m["Pred_Unseen"].notna()))
@@ -1181,7 +1310,7 @@ def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     return {"metrics": metrics, "history": _scores(m["Oil_Rate"], m["Pred"]),
             "pred": est[["Date", "Well", "Oil_Rate", "Pred", "Pred_Unseen", "Split", "Is_Test"]].reset_index(drop=True),
             "importance": importance.sort_values("Importance"), "per_well": per_well, "split": split,
-            "test_mode": test_mode, "n_tests": int(d["Is_Test"].sum()), "w_ml": w_ml,
+            "test_mode": test_mode, "n_tests": int(d["Is_Test"].sum()), "w_ml": w_ml, "weights": weights,
             "untested_days": int(est["Oil_Rate"].isna().sum())}
 
 
@@ -1199,6 +1328,11 @@ def fit_declines(key: str, _df: pd.DataFrame, horizon: int = 180):
     win, min_pts = (3, 6) if tests else (7, 15)
     for well, g in df.sort_values("Date").groupby("Well", sort=True):
         meas = g.dropna(subset=["Oil_Rate"])                 # fit ONLY real measured rates, at their real dates
+        meas = meas[meas["Oil_Rate"] > 0]                    # shut-in days are downtime, not decline
+        if "Hours_On" in meas.columns and (meas["Hours_On"] >= 20).sum() >= min_pts:
+            meas = meas[~(meas["Hours_On"] < 20)]            # partial-hour days understate the well's capacity
+        if len(meas) < min_pts:
+            continue
         if "Choke_Size" in g.columns:   # a bean change starts a new decline segment
             change = np.flatnonzero(g["Choke_Size"].diff().fillna(0).to_numpy() != 0)
             if len(change):
@@ -1972,7 +2106,7 @@ def ask_offline(question: str, f: "Field") -> dict:
         best, score = None, 0.0
         for col in f.raw.columns:
             num = pd.to_numeric(f.raw[col], errors="coerce")
-            if num.notna().mean() < 0.6:
+            if num.notna().mean() < 0.3 or num.nunique() < 2:
                 continue
             name = _strip_units(col)
             sc = max([difflib.SequenceMatcher(None, name, " ".join(words[i:i + n])).ratio()
@@ -2016,6 +2150,8 @@ def ask_offline(question: str, f: "Field") -> dict:
         n_w = 3 if is_test_mode(f.df) else 30
         for w, g in d.groupby("Well"):
             g = g.dropna(subset=[col_]).sort_values("Date")          # compare real measurements only
+            if col_ in RATE_COLUMNS + ["Liquid_Rate"]:
+                g = g[g[col_] > 0]                                    # a shut-in day is downtime, not decline
             a, b = g.tail(n_w)[col_].mean(), g.iloc[-2 * n_w:-n_w][col_].mean()
             rows.append({"Well": w, f"Last {n_w} measurements": a, f"Previous {n_w}": b,
                          "Change (%)": (a / b - 1) * 100 if b else np.nan})
@@ -2910,6 +3046,17 @@ def page_quality(f: Field):
         card_header("Cleaning log")
         items = [f"Rows without a valid date or well ID removed: <b>{r['bad_keys']}</b>",
                  f"Ignored columns: <b>{esc(', '.join(r['ignored']) or 'none')}</b>"]
+        if r.get("injection_rows_removed"):
+            c, n = r["injection_rows_removed"]
+            items.append(f"Injector rows set aside (column <b>{esc(c)}</b>): <b>{n:,}</b> — "
+                         "production analysis uses producing rows only")
+        if r.get("non_producers"):
+            items.append(f"Wells with no oil production set aside: <b>{esc(', '.join(r['non_producers']))}</b>")
+        if r.get("extra_signals"):
+            items.append(f"Extra continuous signals also used by the AI: <b>{esc(', '.join(r['extra_signals']))}</b>")
+        for c, n in r.get("dead_gauge", {}).items():
+            items.append(f"{FIELD_LABELS.get(c, c)} read exactly 0 while flowing (dead gauge) on <b>{n:,}</b> days "
+                         "— treated as missing, not as real pressure")
         km = r.get("kept_as_measured", {})
         if km:
             items.append("Well-test rates kept <b>exactly as measured — never filled in</b>: " + ", ".join(
