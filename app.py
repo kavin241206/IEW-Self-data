@@ -1522,7 +1522,6 @@ def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
     fl = pd.DataFrame({c: flowing.dropna(subset=[c]).groupby("Well").tail(n_recent).groupby("Well")[c].mean()
                        for c in ["Oil_Rate", "Water_Rate", "Liquid_Rate"]})
     recent["Oil while flowing"] = recent["Well"].map(fl["Oil_Rate"])
-    recent["Liquid while flowing"] = recent["Well"].map(fl["Liquid_Rate"])
     recent["WC while flowing"] = recent["Well"].map(100 * fl["Water_Rate"] / fl["Liquid_Rate"].replace(0, np.nan))
     # A well whose latest measurements are all zero is shut in — note since when
     meas = d.dropna(subset=["Oil_Rate"])
@@ -2568,19 +2567,11 @@ def page_overview(f: Field, ranked, vfm, dca, fc, curves=None):
             columns={"Oil_Rate": "Oil now m³/d", "Water_Cut": "WC % (flowing)"}), 1, height=388)
     a, b = st.columns(2, gap="large")
     with a:
-        card_header("Oil vs water cut", "every well at its latest producing rate · bubble = liquid · "
-                    "hollow = shut in now · colour = priority")
-        pf = ranked.assign(
-            Oil=ranked["Oil while flowing"].fillna(ranked["Oil_Rate"]),
-            Liquid=ranked["Liquid while flowing"].fillna(ranked["Liquid_Rate"]).fillna(0).clip(lower=1e-6),
-            State=np.where(ranked["Shut in since"].notna(), "Shut in", "Producing"),
-        ).dropna(subset=["Water_Cut", "Oil"])
-        fig = px.scatter(pf, x="Water_Cut", y="Oil", size="Liquid", color="Priority", symbol="State", text="Well",
-                         color_discrete_map=PRIORITY_COLORS, size_max=38,
-                         symbol_map={"Producing": "circle", "Shut in": "circle-open"},
-                         hover_data={"Why": True, "Liquid": ":.0f", "State": True})
-        fig.update_traces(textposition="top center", textfont=dict(size=10), marker=dict(line=dict(width=2)))
-        chart(fig, 350, xaxis_title="Water cut while producing (%)", yaxis_title="Oil while producing (m³/d)")
+        card_header("Oil vs water cut", "bubble = liquid rate · colour = priority")
+        fig = px.scatter(ranked, x="Water_Cut", y="Oil_Rate", size="Liquid_Rate", color="Priority", text="Well",
+                         color_discrete_map=PRIORITY_COLORS, hover_data={"Why": True})
+        fig.update_traces(textposition="top center", textfont=dict(size=10))
+        chart(fig, 350, xaxis_title="Water cut (%)", yaxis_title="Oil (m³/d)")
     with b:
         card_header("180-day oil outlook", "sum of per-well decline curves")
         if not fc.empty:
