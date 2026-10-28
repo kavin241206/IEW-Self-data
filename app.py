@@ -1515,12 +1515,31 @@ def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
     latest = d.groupby("Well").tail(1).drop(columns=["Oil_Rate", "Water_Rate", "Liquid_Rate", "Water_Cut"])
     cols = ["Oil_Rate", "Water_Rate", "Liquid_Rate"] + (["Energy_kWh"] if "Energy_kWh" in d.columns else [])
     n_recent = 3 if is_test_mode(df) else 7          # average of the latest REAL measurements, never filled values
+    # Rates and water cut describe the well WHILE IT PRODUCES: shut-in zeros would hide a 97 % water cut.
+    flowing = d[(d["Oil_Rate"].fillna(0) + d["Water_Rate"].fillna(0)) > 0]
     recent = pd.DataFrame({c: d.dropna(subset=[c]).groupby("Well").tail(n_recent).groupby("Well")[c].mean()
-                           for c in cols}).rename_axis("Well").reset_index()
+                           for c in cols}).rename_axis("Well").reset_index()          # current rates (0 if shut in)
+    fl = pd.DataFrame({c: flowing.dropna(subset=[c]).groupby("Well").tail(n_recent).groupby("Well")[c].mean()
+                       for c in ["Oil_Rate", "Water_Rate", "Liquid_Rate"]})
+    recent["Oil while flowing"] = recent["Well"].map(fl["Oil_Rate"])
+    recent["WC while flowing"] = recent["Well"].map(100 * fl["Water_Rate"] / fl["Liquid_Rate"].replace(0, np.nan))
+    # A well whose latest measurements are all zero is shut in — note since when
+    meas = d.dropna(subset=["Oil_Rate"])
+    last_n = meas.groupby("Well").tail(n_recent)
+    shut = last_n.groupby("Well")["Oil_Rate"].max().fillna(0) <= 0
+    last_flow = flowing.groupby("Well")["Date"].max()
+    since = {}
+    for w in shut.index[shut.to_numpy()]:
+        after = meas.loc[meas["Well"] == w, "Date"]
+        if w in last_flow.index:
+            after = after[after > last_flow[w]]
+        if len(after):
+            since[w] = after.min()
+    recent["Shut in since"] = pd.to_datetime(recent["Well"].map(since))
     last_test = d.dropna(subset=["Oil_Rate"]).groupby("Well")["Date"].max().rename("Last test")
     recent = recent.merge(last_test.reset_index(), on="Well", how="left")
     latest = latest.drop(columns=[c for c in cols if c in latest.columns]).merge(recent, on="Well")
-    latest["Water_Cut"] = 100 * latest["Water_Rate"] / latest["Liquid_Rate"].replace(0, np.nan)
+    latest["Water_Cut"] = latest["WC while flowing"]      # a shut-in well keeps the water cut it last produced at
     if "Energy_kWh" in latest.columns:
         latest["kWh_per_bbl"] = latest["Energy_kWh"] / (latest["Oil_Rate"] * M3_TO_BBL).replace(0, np.nan)
     latest = latest.merge(dca[["Well", "Decline (%/yr)"]], on="Well", how="left") if not dca.empty \
@@ -1541,6 +1560,8 @@ def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
             pts += 2; why.append(f"steep decline {dec:.0f}%/yr")
         elif pd.notna(dec) and dec >= s.decline_watch:
             pts += 1; why.append(f"decline {dec:.0f}%/yr")
+        if pd.notna(r.get("Shut in since")):
+            pts += 1; why.append(f"shut in since {r['Shut in since']:%d %b %Y}")
         if r["Status"] == "ALERT":
             pts += 3; why.append(f"equipment alert ({r['Main signal']})")
         elif r["Status"] == "EARLY WARNING":
@@ -2363,6 +2384,16 @@ def chart(fig, height=330, legend=True, **layout):
     st.plotly_chart(fig, config={"displayModeBar": False}, **W)
 
 
+def _compact(x: float) -> str:
+    """18,607 → '18.6k' so ranges fit inside a KPI card."""
+    if pd.isna(x):
+        return "—"
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e4, "k")):
+        if abs(x) >= div:
+            return f"{x / (div if suf != 'k' else 1e3):,.1f}{suf}"
+    return f"{x:,.0f}" if abs(x) >= 100 else f"{x:,.1f}"
+
+
 def table(frame: pd.DataFrame, decimals=1, height=None):
     out = frame.copy()
     num = out.select_dtypes("number").columns
@@ -2533,7 +2564,7 @@ def page_overview(f: Field, ranked, vfm, dca, fc, curves=None):
     with right:
         card_header("Attention queue", "ranked by water cut, decline and equipment risk")
         table(ranked[["Well", "Priority", "Oil_Rate", "Water_Cut", "Why"]].rename(
-            columns={"Oil_Rate": "Oil m³/d", "Water_Cut": "WC %"}), 1, height=388)
+            columns={"Oil_Rate": "Oil now m³/d", "Water_Cut": "WC % (flowing)"}), 1, height=388)
     a, b = st.columns(2, gap="large")
     with a:
         card_header("Oil vs water cut", "bubble = liquid rate · colour = priority")
@@ -2723,10 +2754,11 @@ def page_forecast(f: Field):
     acc, base = r0["accuracy"], r0["baseline"]
     kpi_row([(f"{fc_label(main_v)} · next {n0} {per0}s", f"{nxt:,.1f} {unit0}", f"{word.lower()}, mean per {per0}"),
              ("Change vs last period", fmt(chg, "+.1f", "%"), f"vs the last {n0} {per0}s", "warn" if chg < -5 else ""),
-             ("Likely range (P10–P90)", f"{fut['P10'].mean():,.0f} – {fut['P90'].mean():,.0f}", unit0),
+             ("Likely range (P10–P90)", f"{_compact(fut['P10'].mean())} – {_compact(fut['P90'].mean())}",
+              f"{unit0} · 80% chance the real value lands here"),
              ("Blind-test accuracy", fmt(acc, ".1f", "%"), f"on the last {n0} {per0}s it never saw",
               "good" if acc >= 90 else "warn"),
-             ("vs last-value guess", fmt(acc - base, "+.1f", " pts"), f"naive accuracy {fmt(base, '.1f', '%')}",
+             ("vs last-value guess", fmt(acc - base, "+.1f", " pts"), f"repeating the last value scores {fmt(base, '.1f', '%')}",
               "good" if acc >= base else "")])
     sparse = [v for v, r in results.items() if r["code"] != code or r["density"] < TEST_MODE_THRESHOLD]
     if sparse:
